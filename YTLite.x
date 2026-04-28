@@ -319,31 +319,106 @@ static UIImage *YTImageNamed(NSString *imageName) {
 }
 %end
 
-// Extra Speed Options
+// ─── YTSpeed (https://github.com/Lyvendia/YTSpeed) ───────────────────────────
+#define kYTLSpeedKey  @"YTLiteSpeed_PlaybackRate"
+#define kYTLDefRate   1.0f
+
+// Pure ObjC ivar helpers (replaces MSHookIvar which requires C++)
+static void ytlSetFloatIvar(id obj, const char *name, float val) {
+    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+    if (iv) *(float *)((char *)(__bridge void *)obj + ivar_getOffset(iv)) = val;
+}
+static id ytlGetObjIvar(id obj, const char *name) {
+    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+    return iv ? object_getIvar(obj, iv) : nil;
+}
+
 %hook YTVarispeedSwitchController
-- (void)setDelegate:(id)arg1 {
-    NSMutableArray *optionsCopy = [[self valueForKey:@"_options"] mutableCopy];
-    NSArray *speedOptions = @[@"2.5", @"3", @"3.5", @"4", @"5"];
-
-    for (NSString *title in speedOptions) {
-        float rate = [title floatValue];
-        YTVarispeedSwitchControllerOption *option = [[%c(YTVarispeedSwitchControllerOption) alloc] initWithTitle:title rate:rate];
-        [optionsCopy addObject:option];
+- (instancetype)init {
+    if ((self = %orig)) {
+        float speeds[] = {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0,
+                          2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0};
+        int size = sizeof(speeds) / sizeof(float);
+        NSMutableArray *opts = [NSMutableArray arrayWithCapacity:size];
+        for (int i = 0; i < size; i++) {
+            NSString *t = [NSString stringWithFormat:@"%.4gx", speeds[i]];
+            id opt = [[%c(YTVarispeedSwitchControllerOption) alloc] initWithTitle:t rate:speeds[i]];
+            if (opt) [opts addObject:opt];
+        }
+        @try { [self setValue:[opts copy] forKey:@"_options"]; } @catch (...) {}
     }
-
-    if (ytlBool(@"extraSpeedOptions")) [self setValue:[optionsCopy copy] forKey:@"_options"];
-
-    return %orig;
+    return self;
 }
 %end
 
-// Temprorary Fix For 'Classic Video Quality' and 'Extra Speed Options'
+%hook YTLocalPlaybackController
+- (instancetype)initWithParentResponder:(id)a1 overlayFactory:(id)a2 playerView:(id)a3
+              playbackControllerDelegate:(id)a4 viewportSizeProvider:(id)a5
+    shouldDelayAdsPlaybackCoordinatorCreation:(BOOL)a6 {
+    float saved = [[NSUserDefaults standardUserDefaults] floatForKey:kYTLSpeedKey];
+    if ((self = %orig))
+        ytlSetFloatIvar(self, "_restoredPlaybackRate", saved == 0 ? kYTLDefRate : saved);
+    return self;
+}
+- (void)setPlaybackRate:(float)rate {
+    %orig;
+    [[NSUserDefaults standardUserDefaults] setFloat:rate forKey:kYTLSpeedKey];
+}
+%end
+
+%hook MLHAMQueuePlayer
+- (instancetype)initWithStickySettings:(id)a1 playerViewProvider:(id)a2 {
+    id result = %orig;
+    float saved = [[NSUserDefaults standardUserDefaults] floatForKey:kYTLSpeedKey];
+    [self setRate:saved == 0 ? kYTLDefRate : saved];
+    return result;
+}
+- (void)setRate:(float)rate {
+    ytlSetFloatIvar(self, "_rate", rate);
+    ytlSetFloatIvar(self, "_preferredRate", rate);
+    @try { [(id)ytlGetObjIvar(self, "_player") performSelector:@selector(setRate:) withObject:@(rate)]; } @catch (...) {}
+    @try { [(id)ytlGetObjIvar(self, "_stickySettings") performSelector:@selector(setRate:) withObject:@(rate)]; } @catch (...) {}
+    @try {
+        SEL sel = NSSelectorFromString(@"broadcastRateChange:");
+        id ec = self.playerEventCenter;
+        if ([ec respondsToSelector:sel]) ((void(*)(id,SEL,float))objc_msgSend)(ec, sel, rate);
+    } @catch (...) {}
+    @try { [(YTSingleVideoController *)self.delegate playerRateDidChange:rate]; } @catch (...) {}
+}
+%end
+
+// Fix playback rate changes on newer YouTube versions (ported from uYouEnhanced)
+// YTPlayerOverlayManager is the correct target for rate changes — it owns varispeedController
+%hook YTPlayerOverlayManager
+%property (nonatomic, assign) float currentPlaybackRate;
+
+%new
+- (void)setCurrentPlaybackRate:(float)rate {
+    [self varispeedSwitchController:self.varispeedController didSelectRate:rate];
+}
+
+%new
+- (void)setPlaybackRate:(float)rate {
+    [self varispeedSwitchController:self.varispeedController didSelectRate:rate];
+}
+%end
+
+// varispeedController can be nil on newer versions — fall back to overlayManager's copy
+%hook YTPlayerViewController
+- (id)varispeedController {
+    id controller = %orig;
+    if (controller == nil && [self respondsToSelector:@selector(overlayManager)])
+        controller = [self.overlayManager varispeedController];
+    return controller;
+}
+%end
+
+// Temporary Fix For 'Classic Video Quality'
 %hook YTVersionUtils
 + (NSString *)appVersion {
     NSString *originalVersion = %orig;
     NSString *fakeVersion = @"18.18.2";
-
-    return (!ytlBool(@"classicQuality") && !ytlBool(@"extraSpeedOptions") && [originalVersion compare:fakeVersion options:NSNumericSearch] == NSOrderedDescending) ? originalVersion : fakeVersion;
+    return (!ytlBool(@"classicQuality") && [originalVersion compare:fakeVersion options:NSNumericSearch] == NSOrderedDescending) ? originalVersion : fakeVersion;
 }
 %end
 
@@ -352,12 +427,12 @@ static UIImage *YTImageNamed(NSString *imageName) {
 - (void)setDetailText:(id)arg1 {
     NSDictionary *infoDictionary = [[NSBundle mainBundle] infoDictionary];
     NSString *appVersion = infoDictionary[@"CFBundleShortVersionString"];
-
-    if ([arg1 isEqualToString:@"18.18.2"]) {
-        arg1 = appVersion;
-    } %orig(arg1);
+    if ([arg1 isEqualToString:@"18.18.2"]) arg1 = appVersion;
+    %orig(arg1);
 }
 %end
+
+
 
 // Disable Snap To Chapter (https://github.com/qnblackcat/uYouPlus/blob/main/uYouPlus.xm#L457-464)
 %hook YTSegmentableInlinePlayerBarView
@@ -461,12 +536,14 @@ void autoSkipShorts(YTPlayerViewController *self, YTSingleVideoController *video
 
 %new
 - (void)setAutoSpeed {
-    if ([self.activeVideoPlayerOverlay isKindOfClass:NSClassFromString(@"YTMainAppVideoPlayerOverlayViewController")]
-        && [self.view.superview isKindOfClass:NSClassFromString(@"YTWatchView")]) {
-        YTMainAppVideoPlayerOverlayViewController *overlayVC = (YTMainAppVideoPlayerOverlayViewController *)self.activeVideoPlayerOverlay;
-
-        NSArray *speedLabels = @[@0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @1.75, @2.0, @3.0, @4.0, @5.0];
-        [overlayVC setPlaybackRate:[speedLabels[ytlInt(@"autoSpeedIndex")] floatValue]];
+    if ([self.view.superview isKindOfClass:NSClassFromString(@"YTWatchView")]) {
+        NSArray *speedLabels = @[@0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @1.75, @2.0, @3.0, @4.0, @5.0, @6.0, @7.0, @8.0, @9.0, @10.0];
+        float rate = [speedLabels[ytlInt(@"autoSpeedIndex")] floatValue];
+        // Route through overlayManager (owns varispeedController) — the correct path on newer YT versions
+        if ([self respondsToSelector:@selector(overlayManager)] && self.overlayManager)
+            [self.overlayManager setPlaybackRate:rate];
+        else if ([self.activeVideoPlayerOverlay isKindOfClass:NSClassFromString(@"YTMainAppVideoPlayerOverlayViewController")])
+            [(YTMainAppVideoPlayerOverlayViewController *)self.activeVideoPlayerOverlay setPlaybackRate:rate];
     }
 }
 
@@ -570,6 +647,26 @@ void autoSkipShorts(YTPlayerViewController *self, YTSingleVideoController *video
 
 // Disable Two Finger Double Tap
 - (BOOL)allowTwoFingerDoubleTapGestureRecognizer { return ytlBool(@"noTwoFingerSnapToChapter") ? NO : %orig; }
+
+// Route setPlaybackRate through overlayManager (fix for newer YouTube versions)
+- (void)setPlaybackRate:(CGFloat)rate {
+    YTPlayerViewController *playerVC = self.parentViewController;
+    if ([playerVC respondsToSelector:@selector(overlayManager)] && playerVC.overlayManager)
+        [playerVC.overlayManager setPlaybackRate:(float)rate];
+    else
+        %orig(rate);
+}
+
+// Route currentPlaybackRate through overlayManager
+- (CGFloat)currentPlaybackRate {
+    YTPlayerViewController *playerVC = self.parentViewController;
+    if ([playerVC respondsToSelector:@selector(overlayManager)] && playerVC.overlayManager) {
+        id manager = playerVC.overlayManager;
+        if ([manager respondsToSelector:@selector(currentPlaybackRate)])
+            return [manager currentPlaybackRate];
+    }
+    return %orig;
+}
 
 // Copy Timestamped Link by Pressing On Pause
 - (void)didPressPause:(id)arg1 {
@@ -1301,7 +1398,7 @@ BOOL isTabSelected = NO;
 CGFloat rateBeforeSpeedmaster = 1.0;
 
 static void manageSpeedmasterYTLite(UILongPressGestureRecognizer *gesture, YTMainAppVideoPlayerOverlayViewController *delegate, YTInlinePlayerScrubUserEducationView *edu) {
-    NSArray *speedLabels = @[@0, @2.0, @0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @1.75, @2.0, @3.0, @4.0, @5.0];
+    NSArray *speedLabels = @[@0, @2.0, @0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @1.75, @2.0, @3.0, @4.0, @5.0, @6.0, @7.0, @8.0, @9.0, @10.0];
 
     YTLabel *label = [edu valueForKey:@"_userEducationLabel"];
     edu.labelType = 1;
